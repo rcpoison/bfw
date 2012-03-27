@@ -1,0 +1,131 @@
+#!/bin/bash
+# bash firewall
+# retarded 'firewall' script
+
+DAEMON=bfw
+
+set -x
+
+[ -r /etc/conf.d/$DAEMON ] && . /etc/conf.d/$DAEMON
+[ -r /etc/$DAEMON ] && . /etc/$DAEMON
+[ -r ./$DAEMON.conf ] && . ./$DAEMON.conf
+
+bfw_start() {
+	echo " <*> Setting up spoofing protection..."
+	for i in /proc/sys/net/ipv4/conf/*/rp_filter; do
+		echo 1 > $i
+	done
+	
+	echo " <*> Disabling source routed packets..."
+	for i in /proc/sys/net/ipv4/conf/*/accept_source_route; do
+		echo 0 > $i
+	done
+	
+	echo " <*> Creating IPTABLES rules:"
+	echo "  ->  Clear..."
+	iptables -F
+	iptables -t nat -F
+	iptables -t mangle -F
+	iptables -X
+	iptables -t nat -X
+	iptables -t mangle -X
+	
+	echo "  ->  Loopback interface..."
+	iptables -A INPUT -i lo -j ACCEPT
+	iptables -A OUTPUT -o lo -j ACCEPT
+	
+	echo "  ->  Stateful inspection..."
+	iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A INPUT -m state --state INVALID -j DROP
+	
+	echo "  ->  Trusted networks..."
+	for tnet in "${TRUSTED_NET[@]}"; do
+		if [ "${tnet:0:1}" == "!" ]; then
+			continue
+		fi
+		echo "    ->  $tnet"
+		if [ "$TRUSTED_UNRESTRICTED" == "yes" ]; then
+			echo "      >  unrestricted"
+			iptables -A INPUT -s "$tnet" -j ACCEPT
+			if [ "$ENABLE_ROUTING" == "yes" ]; then
+				iptables -A FORWARD -s "$tnet" -j ACCEPT
+			fi
+		else
+			bfw_open_ports "" "$tnet" "tcp" "$ENABLE_ROUTING" TRUSTED_TCP[@]
+			bfw_open_ports "" "$tnet" "udp" "$ENABLE_ROUTING" TRUSTED_UDP[@]
+		fi
+	done
+	
+	echo "    ->  Public:"
+	bfw_open_ports "$IF_INET" "" "tcp" "no" PUBLIC_TCP[@]
+	bfw_open_ports "$IF_INET" "" "udp" "no" PUBLIC_UDP[@]
+	
+	if [ "$ENABLE_ROUTING" == "yes" ]; then
+		echo " ->  Masquerading..."
+		iptables -t nat -A POSTROUTING -o "$IF_INET" -j MASQUERADE
+		iptables -A FORWARD -m state --state ESTABLISHED,RELATED -i "$IF_INET" -j ACCEPT
+		echo 1 > /proc/sys/net/ipv4/ip_forward
+	fi
+	
+	
+	echo " -> Setting default policy..."
+	iptables -P INPUT DROP
+	iptables -P OUTPUT ACCEPT
+	iptables -P FORWARD DROP
+}
+
+function bfw_open_ports() {
+	local iface netw
+	[ -n "$1" ] && iface="-i $1"
+	[ -n "$2" ] && netw="-s ${2}"
+	local proto="$3"
+	local routing="$4"
+	declare -a ports=("${!5}")
+	local ratelimit
+	for port in "${ports[@]}"; do
+		ratelimit=""
+		if [ "${port:0:1}" == "!" ]; then
+			continue
+		elif [ "${port:0:1}" == "-" ]; then
+			ratelimit="(ratelimited)"
+			port="${port:1}"
+		fi
+		echo "      >  $port/$proto $ratelimit"
+		iptables -A INPUT $iface $netw -p "$proto" --dport "$port" -j ACCEPT
+		if [ -n "$ratelimit" ]; then
+			iptables -I INPUT $iface $netw -p "$proto" -m "$proto" --dport "$port" -m state --state NEW -m recent --set --name DEFAULT --rsource
+			iptables -I INPUT $iface $netw -p "$proto" -m "$proto" --dport "$port" -m state --state NEW -m recent --update --seconds "$RATELIMIT_SECONDS" --hitcount "$RATELIMIT_HITCOUNT" --name DEFAULT --rsource -j DROP
+		fi
+		if [ "$ENABLE_ROUTING" == "yes" ]; then
+			iptables -A FORWARD $iface $netw -p "$proto" --dport "$port" -j ACCEPT
+		fi
+	done
+}
+
+bfw_stop () {
+	echo " <*> Shutting down firewall..."
+	echo 0 > /proc/sys/net/ipv4/ip_forward
+	iptables -P INPUT ACCEPT
+	iptables -P OUTPUT ACCEPT
+	iptables -F
+	iptables -t nat -F
+	iptables -t mangle -F
+	iptables -X
+	iptables -t nat -X
+	iptables -t mangle -X
+}
+
+case "$1" in
+	start)
+		bfw_start
+	;;
+	stop)
+		bfw_stop
+	;;
+	restart)
+		bfw_stop
+		bfw_start
+	;;
+	*)
+	echo "usage: $0 {start|stop|restart}"  
+esac
