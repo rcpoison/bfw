@@ -1,0 +1,3 @@
+#!/bin/bash
+install -v -m 0744 bfw /etc/rc.d
+install -v -m 0644 bfw.conf /etc/conf.d/bfw
